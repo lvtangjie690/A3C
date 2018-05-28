@@ -20,7 +20,7 @@ class Config:
     DISCOUNT = 0.99
     
     # Tmax
-    TIME_MAX = 10
+    TIME_MAX = 20
     
     # Reward Clipping
     REWARD_MIN = -1
@@ -90,16 +90,10 @@ class Config:
 
     # Learner's address
     MASTER_IP = 'localhost'
-    MASTER_PORT = 8000
+    MASTER_PORT = 6000
     
     # Worker's base port
-    WORKER_BASE_PORT = 9000
-
-    # Number of Agents
-    AGENTS = 16
-
-    # Number of Predictors
-    PREDICTORS = 2
+    WORKER_BASE_PORT = 7000
 
     # Number of Trainers
     TRAINERS = 1
@@ -109,7 +103,7 @@ class Config:
     GAME_NAME = 'GymGame'
 
     # Game Push Alogorithm
-    GAME_PUSH_ALGORITHM = False
+    GAME_PUSH_ALGORITHM = True
 
     # DEVICE
     DEVICE = '/gpu:0' 

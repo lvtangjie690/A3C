@@ -39,6 +39,12 @@ class MessageParser(object):
         length_msg = struct.pack('I', msg_length)
         sock.sendall(length_msg+json_msg)
 
+    
+    def decode_recv(self, sock):
+        msg = self.recv(sock)
+        return json.loads(msg)
+        
+
 
 class ServerMessageParser(MessageParser):
 

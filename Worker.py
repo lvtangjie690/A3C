@@ -2,10 +2,9 @@
 
 import sys, time
 
-from MessageParser import ServerMessageParser, GameMessageParser
+from MessageParser import MessageParser, GameMessageParser
 
 from Config import Config
-import Const
 
 from NetworkVP import NetworkVP
 from Experience import Experience
@@ -15,72 +14,69 @@ import numpy as np
 import queue
 import socket
 
+from multiprocessing import Process, Queue
+
 import Game
 
-class MsgQueue(object):
+class FakeGame(object):
+    """ FakeGame: recv and send real game's msg and \
+        step as a game for worker
+    """
 
-    def __init__(self):
-        self.state_queue = queue.Queue(maxsize=1)
-        self.action_queue = queue.Queue(maxsize=1)
-        self.sample_queue = queue.Queue(maxsize=1)
-        
-        self.game_model_info_queue = queue.Queue(maxsize=1)
-
-    def get_state(self):
-        return self.state_queue.get()
-
-    def step(self, action):
-        self.action_queue.put(action)
-        sample = self.sample_queue.get()
-        return sample
-    
-    def reset(self):
-        pass
-
-    def get_game_model_info(self):
-        return self.game_model_info_queue.get()
-
-class ThreadWorkerListener(Thread):
-
-    def __init__(self, id, msg_queue):
-        super(ThreadWorkerListener, self).__init__()
-        self.setDaemon(True)
+    def __init__(self, id):
         self.id = id
-        self.last_action = None
+        self.state_queue = queue.Queue(maxsize=1)
 
-        self.msg_queue = msg_queue
+        self.last_action = None        
         self.game_msg_parser = GameMessageParser()
-
-    def init_listener(self):
+        #init game listener
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         port = Config.WORKER_BASE_PORT + self.id
         self.server.bind(('localhost', port))
         self.server.listen(1)
 
     def run(self):
-        print('ThreadWorkerListener Start Running')
-        self.init_listener()
         while True:
-            conn, addr = self.server.accept()
-            print('worker %d accept connection'%self.id, conn, addr)
-            #recv game's state_size and action_size for model init
-            game_model_info = self.game_msg_parser.recv_game_model_info(conn)
-            self.msg_queue.game_model_info_queue.put(game_model_info)
-             
-            while True:
-                sample = self.game_msg_parser.recv_sample(conn)
-                state, reward, done, next_state = sample
-                if self.last_action != None:
-                    self.msg_queue.sample_queue.put(sample)
-                if not done:
-                    self.msg_queue.state_queue.put(next_state)
-                    self.last_action = self.msg_queue.action_queue.get()
-                    self.game_msg_parser.send_action(conn, self.last_action)
-                else:
-                    self.last_action = None
+            # create connection between worker and game
+            self.sock, addr = self.server.accept()
+            break
 
-class Worker(object):
-    def __init__(self, id):
+    def get_state(self):
+        if self.state_queue.empty():
+            # the first frame in an episode
+            sample = self.game_msg_parser.recv_sample(self.sock)
+            state, reward, done, next_state = sample
+            return next_state
+        else:
+            return self.state_queue.get()            
+
+
+    def step(self, action):
+        # send action
+        self.game_msg_parser.send_action(self.sock, action)
+        # recv new sample
+        sample = self.game_msg_parser.recv_sample(self.sock) 
+        state, reward, done, next_state = sample
+        if not done:
+            self.state_queue.put(next_state)
+        return sample
+    
+    def reset(self):
+        pass
+
+    def get_game_model_info(self):
+        return self.game_msg_parser.recv_game_model_info(self.sock)
+
+def gradients_to_list(gradients):
+    gradients = [tuple([var.tolist() for var in item]) for item in gradients]
+    return gradients
+
+def list_to_model(model):
+    model = [np.array(var, dtype=np.float32) for var in model]
+    return model
+
+class Worker(Process):
+    def __init__(self, id, master):
         super(Worker, self).__init__()
         self.id = id
 
@@ -89,15 +85,11 @@ class Worker(object):
         self.device = Config.DEVICE
         self.model = None
 
-        self.server_msg_parser = ServerMessageParser()
-
-        self.master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.master.connect((Config.MASTER_IP, Config.MASTER_PORT))
+        self.master = master
+        self.model_queue = Queue(maxsize=100)
         
         if Config.GAME_PUSH_ALGORITHM:
-            self.game = MsgQueue()
-            self.listener = ThreadWorkerListener(self.id, self.game)
-            self.listener.start()
+            self.game = FakeGame(self.id)
         else:
             self.game = getattr(Game, Config.GAME_NAME)()
 
@@ -146,7 +138,6 @@ class Worker(object):
 
         while not done:
             # very first few frames
-            
             prediction, value = self.predict_p_and_v(self.game.get_state())
             action = self.select_action(prediction)
             state, reward, done, next_state = self.game.step(action)
@@ -172,12 +163,14 @@ class Worker(object):
 
     def run(self):
         print('Worker %d Start Running'%self.id)
+        if Config.GAME_PUSH_ALGORITHM:
+            self.game.run()
 
         state_space_size, action_space_size = self.game.get_game_model_info()
         self.init_model(state_space_size, action_space_size)
-        
-        self.server_msg_parser.send_to_master(self.master, Const.MSG_TYPE_INIT, (state_space_size, action_space_size))
-        model = self.server_msg_parser.recv_from_master(self.master)
+
+        self.master.init_queue.put((self.id, state_space_size, action_space_size))
+        model = list_to_model(self.model_queue.get())
         self.model.update(model)
 
         time.sleep(np.random.rand())
@@ -188,13 +181,15 @@ class Worker(object):
             total_length = 0
             for x_, r_, a_, reward_sum in self.run_episode():
                 total_reward += reward_sum
-                total_length += len(r_) + 1  # +1 for last frame that we drop
+                total_length += len(r_)
                 # compute gradients and send to the master
-                gradients = self.model.compute_gradients(x_, r_, a_)
-                self.server_msg_parser.send_to_master(self.master, Const.MSG_TYPE_GRADIENTS, gradients)
-                model = self.server_msg_parser.recv_from_master(self.master)
+                gradients = gradients_to_list(self.model.compute_gradients(x_, r_, a_))
+                self.master.gradients_queue.put((self.id, gradients))
+                # recv model from master
+                model = list_to_model(self.model_queue.get())
                 self.model.update(model)
-            self.server_msg_parser.send_to_master(self.master, Const.MSG_TYPE_LOG, (total_reward, total_length))
+            # send log to master
+            self.master.log_queue.put((total_reward, total_length))
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

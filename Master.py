@@ -1,54 +1,17 @@
 # Copyright (c) 2016, hzlvtangjie. All rights reserved.
 
-import platform
-if platform.python_version()[0] == '2':
-    import Queue as queue
-else:
-    import queue
-
-from threading import Thread, Lock
+from threading import Thread
 import socket
-
-from MessageParser import ServerMessageParser
 from Config import Config
-import Const
+
 from NetworkVP import NetworkVP
 
 from multiprocessing import Queue, Process
 
 import time
 
-init_model_lock = Lock()
-
-class WorkerSocketThread(Thread):
-    """Send and recv thread for a worker
-    """
-
-    def __init__(self, id, master, sock):
-        super(WorkerSocketThread, self).__init__()
-        self.id = id
-        self.master = master
-        self.sock = sock
-        self.server_msg_parser = ServerMessageParser()
-        self.send_queue = queue.Queue(maxsize=1)
-
-    def run(self):
-        while True:
-            type, info = self.server_msg_parser.recv_from_worker(self.sock)
-            if type == Const.MSG_TYPE_GRADIENTS:
-                self.master.gradients_queue.put((self.id, info))
-                model = self.send_queue.get()
-                self.server_msg_parser.send_to_worker(self.sock, model)
-            elif type == Const.MSG_TYPE_INIT:
-                init_model_lock.acquire()
-                if self.master.model is None:
-                    #use worker 0's info to init model
-                    self.master.init_model(info[0], info[1])
-                init_model_lock.release()
-                model = self.master.model.dumps()
-                self.server_msg_parser.send_to_worker(self.sock, model)
-            elif type == Const.MSG_TYPE_LOG:
-                self.master.log_queue.put(info)
+from Worker import Worker
+from MessageParser import MessageParser
 
 class TrainingThread(Thread):
     """Master's training thread
@@ -61,9 +24,53 @@ class TrainingThread(Thread):
     def run(self):
         print("TrainingThread starts running")
         while True:
+            start = time.time()
             id, gradients = self.master.gradients_queue.get()
+            #print('recv gradients cost', time.time()-start)
+            start = time.time()
             self.master.model.apply_gradients(gradients)
-            self.master.workers[id].send_queue.put(self.master.model.dumps())
+            #print('apply gradients cost', time.time()-start)
+            start = time.time()
+            self.master.workers[id].model_queue.put(self.master.model.dumps())
+            #print('send model cost', time.time()-start)
+
+class InitListenerThread(Thread):
+    """init model listener
+    """
+    
+    def __init__(self, master):
+        super(InitListenerThread, self).__init__()
+        self.master = master
+
+    def run(self):
+        print("InitListenerThread starts running")
+        while True:
+            id, state_space_size, action_space_size = self.master.init_queue.get()
+            if self.master.model is None:
+                self.master.init_model(state_space_size, action_space_size)
+            self.master.workers[id].model_queue.put(self.master.model.dumps())
+
+class GameListenerThread(Thread):
+    """Game Listener
+    """
+
+    def __init__(self, master):
+        super(GameListenerThread, self).__init__()
+        self.master = master
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((Config.MASTER_IP, Config.MASTER_PORT))
+        self.server.listen(32)
+
+
+    def run(self):
+        print("GameListenerThread starts running")
+        while True:
+            sock, addr = self.server.accept()
+            print('Master accept connection', sock, addr)
+            worker = self.master.add_worker()
+            MessageParser().send(sock, worker.id)
+            time.sleep(0.1)
+            
 
 class Stats(Process):
 
@@ -109,52 +116,80 @@ class Master(object):
 
     def __init__(self):
         self.workers = []
-        device = 'cpu:0'
-        self.device = device
+        self.device = Config.DEVICE
         self.model = None
-        self.gradients_queue = queue.Queue(maxsize=100)
+        self.gradients_queue = Queue(maxsize=100)
 
         self.log_queue = Queue(maxsize=100)
         self.stats = Stats(self.log_queue) 
 
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.bind((Config.MASTER_IP, Config.MASTER_PORT))
-        self.server.listen(32)
+        self.init_queue = Queue(maxsize=1)
+
 
     def init_model(self, state_space_size, action_space_size):
         self.model = NetworkVP(self.device, Config.NETWORK_NAME, state_space_size, action_space_size)
 
-
-    def add_worker(self, sock):
-        worker = WorkerSocketThread(len(self.workers), self, sock)
+    def add_worker(self):
+        worker = Worker(len(self.workers), self)
         self.workers.append(worker)
         self.workers[-1].start()
+        return worker
 
     def remove_workers(self):
         while len(self.workers) > 0:
             worker_thread = self.workers.pop(0)
             worker_thread.join()
 
-    def run(self):
-        self.stats.start()
+    def add_trainer(self):
+        trainer = TrainingThread(self)
+        self.trainers.append(trainer)
+        self.trainers[-1].start()
 
-        self.training_thread = TrainingThread(self)
-        self.training_thread.start()
+    def remove_trainers(self):
+        while len(self.trainers) > 0:
+            trainer_thread = self.trainers.pop(0)
+            trainer_thread.join()
+
+    def run(self, init_workers):
+        self.stats.start()
+        self.init_listener = InitListenerThread(self)
+        self.init_listener.start()
+
+        if Config.GAME_PUSH_ALGORITHM:
+            self.game_listener = GameListenerThread(self)
+            self.game_listener.start()
+        else:
+            self.game_listener = None
+
+
+        for _ in range(Config.TRAINERS):
+            self.training_thread = TrainingThread(self)
+            self.training_thread.start()
+
+        if not Config.GAME_PUSH_ALGORITHM:
+            for _ in range(init_workers):
+                self.add_worker()
 
         while True:
-            conn, addr = self.server.accept()
-            print('Master accept connection', conn, addr)
-            self.add_worker(conn)
-            time.sleep(0.1)
+            time.sleep(10)
 
+        # close init_listener
+        self.init_listener.join()
+        # close game_listener
+        if self.game_listener:
+            self.game_listener.join()
         # remove worker thread
         self.remove_workers()
-        # close training thread
-        self.training_thread.join()
+        # remove trainer thread
+        self.remove_trainers()
         # close stats process 
         self.stats.join()
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print('Usage: python Master.py int(init_workers)')
+        sys.exit(0)
     master = Master()
-    master.run()
+    master.run(int(sys.argv[1]))

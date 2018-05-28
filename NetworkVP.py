@@ -63,9 +63,9 @@ class NetworkVP(object):
         # nb_elements = flatten_input_shape[1] * flatten_input_shape[2] * flatten_input_shape[3]
 
         # self.flat = tf.reshape(_input, shape=[-1, nb_elements._value])
-        self.fc1 = self.dense_layer(self.x, 8, 'fc1')
+        self.fc1 = self.dense_layer(self.x, 16, 'fc1')
         #self.fc2 = self.dense_layer(self.fc1, 16, 'fc2')
-        self.d1 = self.dense_layer(self.fc1, 8, 'dense1')
+        self.d1 = self.dense_layer(self.fc1, 16, 'dense1')
 
         self.logits_v = tf.squeeze(self.dense_layer(self.d1, 1, 'logits_v', func=None), axis=[1])
         self.cost_v = 0.5 * tf.reduce_sum(tf.square(self.y_r - self.logits_v), axis=0)
@@ -232,7 +232,9 @@ class NetworkVP(object):
         self.sess.run(self.train_op, feed_dict = feed_dict)
 
     def dumps(self):
-        return self.sess.run(self.vars)
+        model = self.sess.run(self.vars)
+        model = [var.tolist() for var in model]
+        return model
 
     def update(self, vars):
         feed_dict = {}
