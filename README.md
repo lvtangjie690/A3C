@@ -7,7 +7,7 @@
     3. Only support python3
     4. It will start 1 master and n workers when running
 
-* Support Windows and Linux
+* Support  Linux
 
 * Two Modes:  Algorithm Push Mode & Game Push Mode. 
     
@@ -18,10 +18,3 @@
 * Linux:
     * start: sh start.sh 
     * stop:  sh stop.sh
-
-* Windows: You should start the python program by yourself
-    * start: 
-        1. start the master:  python Master.py
-        2. start the game:    python ProcessGame.py
-    * stop: 
-        1. kill the running processes
